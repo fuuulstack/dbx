@@ -331,6 +331,23 @@ describe("query editor extend selection", () => {
     expect(sequence).toContain("coalesce((select max(score) from scores where user_id = u.id), 0)");
   });
 
+  it("extends through individual query blocks before chained set expressions", () => {
+    const doc = "select a from t union select b from u union select c from v";
+    const sequence = selectionSequence(doc, doc.indexOf("a"), "sql");
+
+    expect(sequence).toContain("select a from t");
+    expect(sequence).toContain("select a from t union select b from u");
+    expect(sequence).toContain(doc);
+  });
+
+  it("keeps valid statement semantics when a later statement is incomplete", () => {
+    const doc = "select * from t where a = 1;\nselect (";
+    const sequence = selectionSequence(doc, doc.indexOf("a ="), "sql");
+
+    expect(sequence).toContain("a = 1");
+    expect(sequence).toContain("where a = 1");
+  });
+
   it("selects escaped SQL string content before the complete literal", () => {
     const doc = "select * from t where name = 'O''Reilly'";
     const sequence = selectionSequence(doc, doc.indexOf("Reilly") + 2, "sql");

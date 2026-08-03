@@ -29,6 +29,10 @@ interface PreparedStatementWindow extends StatementWindow {
   ranges?: SemanticSelectionRangeIndex;
 }
 
+interface QueryBlockRange extends SemanticSelectionRange {
+  depth: number;
+}
+
 export interface SqlSemanticSelectionAnalysis {
   doc: string;
   statements: readonly PreparedStatementWindow[];
@@ -175,6 +179,17 @@ function rangeEndForDepth(tokens: SqlSelectionToken[], startIndex: number, state
   return statementEnd;
 }
 
+function queryBlockEnd(tokens: SqlSelectionToken[], startIndex: number, statementEnd: number): number {
+  const depth = tokens[startIndex]?.depth ?? 0;
+  for (let index = startIndex + 1; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (!token) continue;
+    if (token.text === ")" && token.depth < depth) return token.from;
+    if (token.depth === depth && token.kind === "word" && SET_OPERATOR_WORDS.has(token.normalized)) return token.from;
+  }
+  return statementEnd;
+}
+
 function nextClauseOrSetBoundary(tokens: SqlSelectionToken[], startIndex: number, statementEnd: number): number {
   const depth = tokens[startIndex]?.depth ?? 0;
   for (let index = startIndex + 1; index < tokens.length; index += 1) {
@@ -314,9 +329,9 @@ function collectExpressionRanges(tokens: SqlSelectionToken[], start: number, end
 function collectSqlRanges(input: string, statement: StatementWindow, maps: { opening: Map<number, number>; closing: Map<number, number> }): SemanticSelectionRange[] {
   const tokens = statement.tokens;
   const ranges: SemanticSelectionRange[] = [];
-  const queryBlocks: SemanticSelectionRange[] = [];
+  const queryBlocks: QueryBlockRange[] = [];
+  const setExpressions: QueryBlockRange[] = [];
   addRange(ranges, statement.start, statement.end);
-  if (tokens[0]?.normalized === "select") queryBlocks.push({ from: statement.start, to: statement.end });
   for (const token of tokens) {
     if (token.kind === "string") {
       const quote = token.quote ?? token.text[0] ?? "";
@@ -339,9 +354,9 @@ function collectSqlRanges(input: string, statement: StatementWindow, maps: { ope
     if (!token) continue;
     if (token.kind === "word" && token.normalized === "select") {
       const previousLength = ranges.length;
-      addTrimmedRange(input, ranges, token.from, rangeEndForDepth(tokens, index, statement.end));
+      addTrimmedRange(input, ranges, token.from, queryBlockEnd(tokens, index, statement.end));
       const queryBlock = ranges.length > previousLength ? ranges[ranges.length - 1] : undefined;
-      if (queryBlock) queryBlocks.push(queryBlock);
+      if (queryBlock) queryBlocks.push({ ...queryBlock, depth: token.depth });
     }
     if (isClauseAt(tokens, index)) addTrimmedRange(input, ranges, clauseStart(tokens, index), nextClauseOrSetBoundary(tokens, index, statement.end));
     if (token.kind === "word" && !isExpressionBoundary(token) && maps.opening.has(index + 1)) {
@@ -355,9 +370,13 @@ function collectSqlRanges(input: string, statement: StatementWindow, maps: { ope
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
     if (token?.kind === "word" && SET_OPERATOR_WORDS.has(token.normalized)) {
-      const left = queryBlocks.find((range) => range.to <= token.from);
-      const right = queryBlocks.find((range) => range.from >= token.to);
-      if (left && right) addRange(ranges, left.from, right.to);
+      const left = [...queryBlocks, ...setExpressions].filter((range) => range.depth === token.depth && range.to <= token.from).sort((a, b) => b.to - a.to || a.from - b.from)[0];
+      const right = queryBlocks.filter((range) => range.depth === token.depth && range.from >= token.to).sort((a, b) => a.from - b.from || a.to - b.to)[0];
+      if (left && right) {
+        const expression = { from: left.from, to: right.to, depth: token.depth };
+        addRange(ranges, expression.from, expression.to);
+        setExpressions.push(expression);
+      }
     }
   }
   return ranges;
@@ -367,10 +386,11 @@ export function analyzeSqlSemanticSelectionRanges(doc: string, options: SqlSeman
   const dialect = sqlSemanticDialectFor(options).id;
   const rawTokens = tokenizeSqlSemantic(doc, dialect);
   const validationTokens = rawTokens.map((token) => ({ kind: token.kind, text: token.text, normalized: token.normalized, from: token.span.start, to: token.span.end, depth: token.depth, quote: token.quote }));
-  if (!validateTokens(doc, validationTokens)) return { doc, statements: [] };
-
   const tokens = normalizeTokens(doc, rawTokens);
-  const statements: PreparedStatementWindow[] = statementWindows(doc, tokens);
+  const statements: PreparedStatementWindow[] = statementWindows(doc, tokens).filter((statement) => {
+    const statementValidationTokens = validationTokens.filter((token) => token.from >= statement.start && token.to <= statement.end);
+    return validateTokens(doc.slice(statement.start, statement.end), statementValidationTokens);
+  });
   return { doc, statements };
 }
 
